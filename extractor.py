@@ -191,6 +191,12 @@ and output requirements.
 
 _client = instructor.from_anthropic(anthropic.Anthropic())
 
+# Stats from the most recent extract_page() call. Read after each call.
+last_stats: dict = {"llm_calls": 0, "parse_errors": []}
+
+_client.on("completion:response", lambda _r: last_stats.__setitem__("llm_calls", last_stats["llm_calls"] + 1))
+_client.on("parse:error", lambda e: last_stats["parse_errors"].append(str(e)[:300]))
+
 
 def extract_page(
     text: str,
@@ -198,9 +204,11 @@ def extract_page(
     *,
     model: str = "claude-haiku-4-5",
     max_tokens: int = 8192,
-    max_retries: int = 2,
+    max_retries: int = 3,
 ) -> PageAnalysis:
     """Call Claude to extract a PageAnalysis from `text`. Raises on validation failure."""
+    last_stats["llm_calls"] = 0
+    last_stats["parse_errors"] = []
     return _client.messages.create(
         model=model,
         max_tokens=max_tokens,

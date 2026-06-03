@@ -10,7 +10,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator, model_validator
 
 
 class EntityType(str, Enum):
@@ -90,6 +90,15 @@ class Entity(BaseModel):
     confidence: Confidence
 
 
+_LABEL_BANDS: dict["SentimentLabel", tuple[float, float]] = {
+    SentimentLabel.VERY_NEGATIVE: (-1.0, -0.6),
+    SentimentLabel.NEGATIVE:      (-0.6, -0.2),
+    SentimentLabel.NEUTRAL:       (-0.2,  0.2),
+    SentimentLabel.POSITIVE:      ( 0.2,  0.6),
+    SentimentLabel.VERY_POSITIVE: ( 0.6,  1.0),
+}
+
+
 class Sentiment(BaseModel):
     """Overall sentiment of the page's primary content."""
 
@@ -113,6 +122,16 @@ class Sentiment(BaseModel):
         description="One- or two-sentence justification for the chosen label, citing tone or word choice.",
     )
     confidence: Confidence
+
+    @model_validator(mode="after")
+    def _label_matches_score(self) -> "Sentiment":
+        low, high = _LABEL_BANDS[self.label]
+        if not (low <= self.score <= high):
+            raise ValueError(
+                f"sentiment.score={self.score} is inconsistent with label={self.label.value!r} "
+                f"(expected [{low}, {high}]). Either fix the label or the score."
+            )
+        return self
 
 
 class ActionItem(BaseModel):

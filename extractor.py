@@ -192,10 +192,36 @@ and output requirements.
 _client = instructor.from_anthropic(anthropic.Anthropic())
 
 # Stats from the most recent extract_page() call. Read after each call.
-last_stats: dict = {"llm_calls": 0, "parse_errors": []}
+# `input_tokens` and `output_tokens` are summed across retries.
+last_stats: dict = {
+    "model": "-",
+    "llm_calls": 0,
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "parse_errors": [],
+}
 
-_client.on("completion:response", lambda _r: last_stats.__setitem__("llm_calls", last_stats["llm_calls"] + 1))
-_client.on("parse:error", lambda e: last_stats["parse_errors"].append(str(e)[:300]))
+
+def _on_completion_response(response) -> None:
+    last_stats["llm_calls"] += 1
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return
+    last_stats["input_tokens"] += getattr(usage, "input_tokens", 0)
+    last_stats["output_tokens"] += getattr(usage, "output_tokens", 0)
+
+
+def _on_parse_error(error) -> None:
+    last_stats["parse_errors"].append(str(error)[:300])
+
+
+_client.on("completion:response", _on_completion_response)
+_client.on("parse:error", _on_parse_error)
+
+
+def reset_stats() -> None:
+    """Zero out last_stats. Call before any code path that may skip extract_page()."""
+    last_stats.update(model="-", llm_calls=0, input_tokens=0, output_tokens=0, parse_errors=[])
 
 
 def extract_page(
@@ -207,8 +233,8 @@ def extract_page(
     max_retries: int = 3,
 ) -> PageAnalysis:
     """Call Claude to extract a PageAnalysis from `text`. Raises on validation failure."""
-    last_stats["llm_calls"] = 0
-    last_stats["parse_errors"] = []
+    reset_stats()
+    last_stats["model"] = model
     return _client.messages.create(
         model=model,
         max_tokens=max_tokens,

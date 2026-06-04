@@ -278,3 +278,33 @@ def extract_page(
             "content": USER_TEMPLATE.format(url=url, text=text),
         }],
     )
+
+
+def extract_page_stream(
+    text: str,
+    url: str,
+    *,
+    model: str = "claude-haiku-4-5",
+    max_tokens: int = 8192,
+):
+    """Yield progressively-complete PageAnalysis snapshots as Claude generates them.
+
+    Each yielded object has all fields Optional (Pydantic Partial semantics).
+    Instructor does NOT run @model_validator / @field_validator on partials,
+    so a streamed snapshot may violate invariants the non-streaming path
+    enforces (sentiment label-score consistency, unique entity names). The
+    caller streams these as best-effort intermediate state.
+    """
+    reset_stats()
+    last_stats["model"] = model
+    return _client.create_partial(
+        response_model=PageAnalysis,
+        model=model,
+        max_tokens=max_tokens,
+        stream=True,
+        system=SYSTEM_PROMPT,
+        messages=[{
+            "role": "user",
+            "content": USER_TEMPLATE.format(url=url, text=text),
+        }],
+    )

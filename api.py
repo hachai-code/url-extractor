@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 import uuid
@@ -9,10 +10,11 @@ import uuid
 import structlog
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, HttpUrl
 
 from db import init_db, log_call, stats as db_stats
-from extractor import extract_page, last_stats, reset_stats
+from extractor import extract_page, extract_page_stream, last_stats, reset_stats
 from fetch import fetch_page
 from schemas import PageAnalysis
 
@@ -107,6 +109,55 @@ def extract(request: ExtractRequest) -> PageAnalysis:
             status_code=502,
             detail=ExtractError(stage="extract", kind=type(exc).__name__, detail=str(exc)).model_dump(),
         ) from exc
+
+
+@app.post("/extract/stream")
+def extract_stream(request: ExtractRequest) -> StreamingResponse:
+    """Same pipeline as /extract, but streams partial PageAnalysis snapshots as
+    Server-Sent Events. Each `data:` line is the JSON of the model so far.
+    A final `event: done` line marks the end. On extraction error, an
+    `event: error` line is sent and the stream closes.
+
+    Note: partial snapshots skip Pydantic validators; the final snapshot may
+    violate invariants the non-streaming /extract enforces. Use /extract when
+    you need full validation; use /extract/stream for progressive UI.
+    """
+    t0 = time.monotonic()
+    url = str(request.url)
+    rlog = log.bind(request_id=uuid.uuid4().hex[:8], url=url)
+    reset_stats()
+    rlog.info("stream_request_received")
+
+    fetched = fetch_page(url)
+    if not fetched.ok:
+        _log(url, t0, status="fetch_failed", error_detail=f"{fetched.error}: {fetched.error_detail}")
+        rlog.warning("fetch_failed", error=fetched.error, detail=fetched.error_detail)
+        status_code = _FETCH_STATUS.get(fetched.error or "", 502)
+        raise HTTPException(
+            status_code=status_code,
+            detail=ExtractError(stage="fetch", kind=fetched.error, detail=fetched.error_detail or "").model_dump(),
+        )
+
+    def event_stream():
+        try:
+            assert fetched.text is not None
+            for partial in extract_page_stream(fetched.text, str(fetched.final_url or url)):
+                yield f"data: {partial.model_dump_json()}\n\n"
+            _log(url, t0, status="ok")
+            rlog.info(
+                "stream_complete",
+                llm_calls=last_stats["llm_calls"],
+                input_tokens=last_stats["input_tokens"],
+                output_tokens=last_stats["output_tokens"],
+                latency_ms=int((time.monotonic() - t0) * 1000),
+            )
+            yield "event: done\ndata: {}\n\n"
+        except Exception as exc:
+            _log(url, t0, status="extract_failed", error_detail=f"{type(exc).__name__}: {str(exc)[:300]}")
+            rlog.exception("stream_failed", kind=type(exc).__name__)
+            yield f"event: error\ndata: {json.dumps({'kind': type(exc).__name__, 'detail': str(exc)[:200]})}\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 @app.get("/metrics")

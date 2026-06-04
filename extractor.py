@@ -39,6 +39,11 @@ and the most important factual claims, each with a confidence score.
   "Apple Computer, Inc." are one entity). Use the most common surface form
   as the name. Choose the most specific type; use "other" only when no
   category fits.
+- When the page is ABOUT a topic (encyclopedia entry, paper abstract,
+  technical reference, tutorial), extract that topic as the first entity
+  even if it's a common-noun concept like "photosynthesis", "large
+  language model", or "fine-tuning". The page's subject is always an
+  entity; do not skip it because it isn't a proper noun.
 - For wikipedia_title: set this only when you are confident a Wikipedia
   article exists for this exact entity. Use null otherwise. Do not guess
   URL slugs.
@@ -147,6 +152,33 @@ not named in the source — do not invent names for them. "Alex" gets 0.55
 because their identity is partially unknown. "Project Lighthouse" gets 0.6
 because it's described as informal/unannounced. Use the full 0.5-0.7 range
 for entities you can extract but where the source itself signals uncertainty.
+  </notes>
+</example>
+
+<example>
+  <source_text>
+    <page_url>https://en.example.org/wiki/Photosynthesis</page_url>
+    <page_content>
+Photosynthesis is a biological process used by plants, algae, and certain
+bacteria to convert light energy into chemical energy stored in carbohydrate
+molecules. The process uses water and carbon dioxide as inputs and produces
+glucose and oxygen as outputs. Most plants use chlorophyll, a pigment found
+in chloroplasts, to absorb light during photosynthesis.
+    </page_content>
+  </source_text>
+  <output_entities>
+    [
+      {"name": "photosynthesis", "type": "other", "mentions": 2, "context": "Biological process that converts light energy into chemical energy; the subject of this page.", "wikipedia_title": "Photosynthesis", "confidence": 0.99},
+      {"name": "chlorophyll", "type": "other", "mentions": 1, "context": "Pigment in chloroplasts used to absorb light during photosynthesis.", "wikipedia_title": "Chlorophyll", "confidence": 0.9},
+      {"name": "chloroplast", "type": "other", "mentions": 1, "context": "Plant cell organelle that contains chlorophyll.", "wikipedia_title": "Chloroplast", "confidence": 0.85}
+    ]
+  </output_entities>
+  <notes>
+The page's subject ("photosynthesis") is extracted as the first entity even
+though it is a common-noun concept, not a proper noun. The same rule applies
+to articles about "large language model", "RLHF", "fine-tuning", "attention
+mechanism", or any other technical concept. If the page is about it, it
+belongs in the entity list.
   </notes>
 </example>
 

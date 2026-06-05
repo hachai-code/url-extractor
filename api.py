@@ -15,8 +15,25 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, HttpUrl
 
-from db import get_analysis, init_db, log_call, save_analysis, stats as db_stats
-from extractor import extract_page, extract_page_stream, last_stats, reset_stats
+import hashlib
+
+from db import (
+    get_analysis,
+    get_cached,
+    init_db,
+    log_call,
+    put_cached,
+    save_analysis,
+    stats as db_stats,
+)
+from extractor import (
+    DEFAULT_MODEL,
+    SYSTEM_PROMPT,
+    extract_page,
+    extract_page_stream,
+    last_stats,
+    reset_stats,
+)
 from fetch import fetch_page
 from schemas import PageAnalysis
 
@@ -47,6 +64,15 @@ app.add_middleware(
 
 class ExtractRequest(BaseModel):
     url: HttpUrl = Field(..., description="The page to fetch and analyze.")
+    force_refresh: bool = Field(
+        default=False,
+        description="If true, skip the cache and re-extract from the page.",
+    )
+
+
+# Hash of the system prompt — when the prompt changes, cache keys change too,
+# so old entries naturally fall out without us having to invalidate them.
+PROMPT_HASH = hashlib.sha256(SYSTEM_PROMPT.encode()).hexdigest()[:16]
 
 
 class ExtractError(BaseModel):
@@ -86,7 +112,14 @@ def extract(request: ExtractRequest) -> PageAnalysis:
     url = str(request.url)
     rlog = log.bind(request_id=uuid.uuid4().hex[:8], url=url)
     reset_stats()
-    rlog.info("request_received")
+    rlog.info("request_received", force_refresh=request.force_refresh)
+
+    if not request.force_refresh:
+        cached = get_cached(url, DEFAULT_MODEL, PROMPT_HASH)
+        if cached is not None:
+            _log(url, t0, status="ok")  # zero tokens / zero cost from reset_stats
+            rlog.info("cache_hit", latency_ms=int((time.monotonic() - t0) * 1000))
+            return PageAnalysis.model_validate(cached)
 
     fetched = fetch_page(url)
     if not fetched.ok:
@@ -102,6 +135,7 @@ def extract(request: ExtractRequest) -> PageAnalysis:
         assert fetched.text is not None  # fetched.ok guarantees this
         result = extract_page(fetched.text, str(fetched.final_url or url))
         _log(url, t0, status="ok")
+        put_cached(url, DEFAULT_MODEL, PROMPT_HASH, result.model_dump(mode="json"))
         rlog.info(
             "extract_ok",
             llm_calls=last_stats["llm_calls"],
@@ -134,7 +168,20 @@ async def extract_stream(request: ExtractRequest) -> StreamingResponse:
     url = str(request.url)
     rlog = log.bind(request_id=uuid.uuid4().hex[:8], url=url)
     reset_stats()
-    rlog.info("stream_request_received")
+    rlog.info("stream_request_received", force_refresh=request.force_refresh)
+
+    if not request.force_refresh:
+        cached = get_cached(url, DEFAULT_MODEL, PROMPT_HASH)
+        if cached is not None:
+            _log(url, t0, status="ok")  # zero tokens / zero cost
+            rlog.info("cache_hit", latency_ms=int((time.monotonic() - t0) * 1000))
+            saved_id = save_analysis(url, cached)
+
+            def cached_stream():
+                yield f"data: {json.dumps(cached)}\n\n"
+                yield f"event: done\ndata: {json.dumps({'id': saved_id})}\n\n"
+
+            return StreamingResponse(cached_stream(), media_type="text/event-stream")
 
     fetched = fetch_page(url)
     if not fetched.ok:
@@ -172,6 +219,8 @@ async def extract_stream(request: ExtractRequest) -> StreamingResponse:
                 latency_ms=int((time.monotonic() - t0) * 1000),
             )
             saved_id = save_analysis(url, last_partial) if last_partial else None
+            if last_partial is not None:
+                put_cached(url, DEFAULT_MODEL, PROMPT_HASH, last_partial)
             yield f"event: done\ndata: {json.dumps({'id': saved_id})}\n\n"
         except Exception as exc:
             _log(url, t0, status="extract_failed", error_detail=f"{type(exc).__name__}: {str(exc)[:300]}")

@@ -6,10 +6,11 @@ after each request, and `stats()` to read aggregates.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import secrets
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 DB_PATH = Path(__file__).parent / "logs.db"
@@ -18,6 +19,8 @@ DB_PATH = Path(__file__).parent / "logs.db"
 # Source: platform.claude.com/docs/en/docs/about-claude/pricing (2026-06-03).
 # Cache-read and cache-write pricing not handled here yet — add when we enable
 # prompt caching. cache_read = 0.1× input, cache_write_5m = 1.25× input.
+DEFAULT_CACHE_TTL_SECONDS = 24 * 60 * 60  # 24 hours
+
 PRICES: dict[str, tuple[float, float]] = {
     "claude-haiku-4-5":  (1.00,  5.00),
     "claude-sonnet-4-5": (3.00, 15.00),
@@ -67,6 +70,18 @@ def init_db() -> None:
             )
             """
         )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS extractions_cache (
+                cache_key   TEXT PRIMARY KEY,
+                url         TEXT NOT NULL,
+                model       TEXT NOT NULL,
+                prompt_hash TEXT NOT NULL,
+                created_at  TEXT NOT NULL,
+                analysis    TEXT NOT NULL
+            )
+            """
+        )
 
 
 def save_analysis(url: str, analysis: dict) -> str:
@@ -78,6 +93,47 @@ def save_analysis(url: str, analysis: dict) -> str:
             (aid, datetime.now(timezone.utc).isoformat(), url, json.dumps(analysis)),
         )
     return aid
+
+
+def _cache_key(url: str, model: str, prompt_hash: str) -> str:
+    """Stable hash of (url, model, prompt) — same inputs always yield same key."""
+    return hashlib.sha256(f"{url}|{model}|{prompt_hash}".encode()).hexdigest()[:32]
+
+
+def get_cached(
+    url: str,
+    model: str,
+    prompt_hash: str,
+    ttl_seconds: int = DEFAULT_CACHE_TTL_SECONDS,
+) -> dict | None:
+    """Return cached analysis if it exists and is fresher than ttl_seconds, else None."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=ttl_seconds)).isoformat()
+    with sqlite3.connect(DB_PATH) as con:
+        row = con.execute(
+            "SELECT analysis FROM extractions_cache WHERE cache_key = ? AND created_at >= ?",
+            (_cache_key(url, model, prompt_hash), cutoff),
+        ).fetchone()
+    return None if row is None else json.loads(row[0])
+
+
+def put_cached(url: str, model: str, prompt_hash: str, analysis: dict) -> None:
+    """Insert or replace a cache entry."""
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute(
+            """
+            INSERT OR REPLACE INTO extractions_cache
+                (cache_key, url, model, prompt_hash, created_at, analysis)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                _cache_key(url, model, prompt_hash),
+                url,
+                model,
+                prompt_hash,
+                datetime.now(timezone.utc).isoformat(),
+                json.dumps(analysis),
+            ),
+        )
 
 
 def get_analysis(aid: str) -> dict | None:

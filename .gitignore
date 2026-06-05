@@ -1,2 +1,21 @@
+# Secrets
 .env
+.env.local
+.env.*.local
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment (uv-managed)
+.venv/
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Generated artifacts
 logs.db
+eval_results.json
+eval_results_*.json

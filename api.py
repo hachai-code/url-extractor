@@ -151,7 +151,9 @@ async def extract_stream(request: ExtractRequest) -> StreamingResponse:
         sentinel = object()
         try:
             assert fetched.text is not None
-            iterator = extract_page_stream(fetched.text, str(fetched.final_url or url))
+            # iter() handles both real iterators and plain iterables (Instructor
+            # returns a list on some paths instead of a generator).
+            iterator = iter(extract_page_stream(fetched.text, str(fetched.final_url or url)))
             loop = asyncio.get_running_loop()
             # Pull from the sync Instructor iterator inside an executor so each
             # yield can flush through the async response stream in real time.

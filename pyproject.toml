@@ -8,6 +8,7 @@ dependencies = [
     "fastapi>=0.136.3",
     "httpx>=0.28.1",
     "instructor>=1.15.1",
+    "langfuse>=4.7.1",
     "pydantic>=2.13.4",
     "python-dotenv>=1.2.2",
     "structlog>=25.5.0",

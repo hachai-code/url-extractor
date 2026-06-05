@@ -19,9 +19,11 @@ library that hides it.
 from __future__ import annotations
 
 import json
+import time
 
 import anthropic
 from dotenv import load_dotenv
+from langfuse import get_client
 from pydantic import ValidationError
 
 from extractor import SYSTEM_PROMPT, USER_TEMPLATE
@@ -30,6 +32,11 @@ from tools import fetch_linked_article, lookup_wikipedia
 
 load_dotenv()
 _client = anthropic.Anthropic()
+
+# Langfuse client. Reads LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY / LANGFUSE_HOST
+# from env. When credentials are missing it logs a warning once and becomes a
+# no-op, so the rest of this file works either way.
+_langfuse = get_client()
 
 
 # ---------------------------------------------------------------------------
@@ -115,12 +122,28 @@ def reset_stats() -> None:
 
 
 def _run_enrichment_tool(name: str, tool_input: dict) -> str:
-    """Run an enrichment tool and return its JSON-string result for tool_result."""
-    fn = TOOL_FUNCTIONS.get(name)
-    if fn is None:
-        return json.dumps({"error": f"unknown tool: {name}"})
-    result = fn(**tool_input)
-    return result.model_dump_json() if result is not None else "null"
+    """Run an enrichment tool and return its JSON-string result for tool_result.
+
+    Wrapped in a Langfuse span so we can see name, input, output, latency in
+    the trace.
+    """
+    with _langfuse.start_as_current_observation(as_type="span", name=f"tool:{name}") as span:
+        t0 = time.monotonic()
+        fn = TOOL_FUNCTIONS.get(name)
+        if fn is None:
+            output_str = json.dumps({"error": f"unknown tool: {name}"})
+            span.update(input=tool_input, output=output_str, metadata={"unknown_tool": True})
+            return output_str
+
+        result = fn(**tool_input)
+        latency_ms = int((time.monotonic() - t0) * 1000)
+        output_obj = result.model_dump(mode="json") if result is not None else None
+        span.update(
+            input=tool_input,
+            output=output_obj,
+            metadata={"latency_ms": latency_ms, "found": result is not None},
+        )
+        return result.model_dump_json() if result is not None else "null"
 
 
 def extract_page_with_tools(
@@ -137,6 +160,9 @@ def extract_page_with_tools(
     times to enrich its understanding, then must call submit_analysis with
     the completed PageAnalysis. A validation failure on submit_analysis is
     sent back as a tool error so the model can fix it on the next iteration.
+
+    The whole loop is wrapped in a Langfuse trace, with one generation
+    observation per LLM call and one span per tool call.
     """
     reset_stats()
     last_stats["model"] = model
@@ -145,67 +171,104 @@ def extract_page_with_tools(
         {"role": "user", "content": USER_TEMPLATE.format(url=url, text=text)},
     ]
 
-    for _ in range(max_iterations):
-        response = _client.messages.create(
-            model=model,
-            max_tokens=max_tokens,
-            tools=TOOLS,
-            system=SYSTEM_PROMPT,
-            messages=messages,
-        )
-        last_stats["llm_calls"] += 1
-        last_stats["input_tokens"] += response.usage.input_tokens
-        last_stats["output_tokens"] += response.usage.output_tokens
+    with _langfuse.start_as_current_observation(
+        as_type="span",
+        name="extract_page_with_tools",
+        input={"url": url, "text_chars": len(text)},
+        metadata={"model": model},
+    ) as trace:
+        try:
+            for iteration in range(max_iterations):
+                with _langfuse.start_as_current_observation(
+                    as_type="generation",
+                    name=f"llm_call_{iteration + 1}",
+                    model=model,
+                ) as gen:
+                    response = _client.messages.create(
+                        model=model,
+                        max_tokens=max_tokens,
+                        tools=TOOLS,
+                        system=SYSTEM_PROMPT,
+                        messages=messages,
+                    )
+                    last_stats["llm_calls"] += 1
+                    last_stats["input_tokens"] += response.usage.input_tokens
+                    last_stats["output_tokens"] += response.usage.output_tokens
 
-        if response.stop_reason != "tool_use":
+                    gen.update(
+                        input=messages,
+                        output=[b.model_dump() for b in response.content],
+                        usage_details={
+                            "input": response.usage.input_tokens,
+                            "output": response.usage.output_tokens,
+                        },
+                        metadata={"stop_reason": response.stop_reason},
+                    )
+
+                if response.stop_reason != "tool_use":
+                    raise RuntimeError(
+                        f"Model stopped without calling submit_analysis "
+                        f"(stop_reason={response.stop_reason})"
+                    )
+
+                # Protocol: every tool_use must be followed by a matching tool_result.
+                messages.append({"role": "assistant", "content": response.content})
+
+                tool_results: list[dict] = []
+                final_result: PageAnalysis | None = None
+
+                for block in response.content:
+                    if block.type != "tool_use":
+                        continue
+
+                    if block.name == "submit_analysis":
+                        try:
+                            final_result = PageAnalysis(**block.input)
+                            tool_results.append({
+                                "type": "tool_result",
+                                "tool_use_id": block.id,
+                                "content": "Analysis accepted.",
+                            })
+                        except ValidationError as exc:
+                            last_stats["validation_errors"].append(str(exc)[:300])
+                            tool_results.append({
+                                "type": "tool_result",
+                                "tool_use_id": block.id,
+                                "content": str(exc)[:1500],
+                                "is_error": True,
+                            })
+                    else:
+                        last_stats["tool_calls"] += 1
+                        last_stats["tool_call_log"].append(
+                            {"name": block.name, "input": block.input}
+                        )
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": _run_enrichment_tool(block.name, block.input),
+                        })
+
+                if final_result is not None:
+                    trace.update(
+                        output={
+                            "entities": len(final_result.entities),
+                            "claims": len(final_result.key_claims),
+                            "title": final_result.title,
+                        },
+                        metadata={
+                            "llm_calls": last_stats["llm_calls"],
+                            "tool_calls": last_stats["tool_calls"],
+                            "input_tokens": last_stats["input_tokens"],
+                            "output_tokens": last_stats["output_tokens"],
+                        },
+                    )
+                    return final_result
+
+                messages.append({"role": "user", "content": tool_results})
+
             raise RuntimeError(
-                f"Model stopped without calling submit_analysis "
-                f"(stop_reason={response.stop_reason})"
+                f"Model did not call submit_analysis within {max_iterations} iterations"
             )
-
-        # Append the assistant turn — protocol requires every tool_use block
-        # to be followed by a user turn containing matching tool_result blocks.
-        messages.append({"role": "assistant", "content": response.content})
-
-        tool_results: list[dict] = []
-        final_result: PageAnalysis | None = None
-
-        for block in response.content:
-            if block.type != "tool_use":
-                continue
-
-            if block.name == "submit_analysis":
-                try:
-                    final_result = PageAnalysis(**block.input)
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": "Analysis accepted.",
-                    })
-                except ValidationError as exc:
-                    last_stats["validation_errors"].append(str(exc)[:300])
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": str(exc)[:1500],
-                        "is_error": True,
-                    })
-            else:
-                last_stats["tool_calls"] += 1
-                last_stats["tool_call_log"].append(
-                    {"name": block.name, "input": block.input}
-                )
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": _run_enrichment_tool(block.name, block.input),
-                })
-
-        if final_result is not None:
-            return final_result
-
-        messages.append({"role": "user", "content": tool_results})
-
-    raise RuntimeError(
-        f"Model did not call submit_analysis within {max_iterations} iterations"
-    )
+        finally:
+            # Short-lived script: flush queued events before returning.
+            _langfuse.flush()

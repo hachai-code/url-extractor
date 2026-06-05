@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -119,7 +120,7 @@ def extract(request: ExtractRequest) -> PageAnalysis:
 
 
 @app.post("/extract/stream")
-def extract_stream(request: ExtractRequest) -> StreamingResponse:
+async def extract_stream(request: ExtractRequest) -> StreamingResponse:
     """Same pipeline as /extract, but streams partial PageAnalysis snapshots as
     Server-Sent Events. Each `data:` line is the JSON of the model so far.
     A final `event: done` line marks the end. On extraction error, an
@@ -145,11 +146,19 @@ def extract_stream(request: ExtractRequest) -> StreamingResponse:
             detail=ExtractError(stage="fetch", kind=fetched.error, detail=fetched.error_detail or "").model_dump(),
         )
 
-    def event_stream():
+    async def event_stream():
         last_partial: dict | None = None
+        sentinel = object()
         try:
             assert fetched.text is not None
-            for partial in extract_page_stream(fetched.text, str(fetched.final_url or url)):
+            iterator = extract_page_stream(fetched.text, str(fetched.final_url or url))
+            loop = asyncio.get_running_loop()
+            # Pull from the sync Instructor iterator inside an executor so each
+            # yield can flush through the async response stream in real time.
+            while True:
+                partial = await loop.run_in_executor(None, next, iterator, sentinel)
+                if partial is sentinel:
+                    break
                 last_partial = partial.model_dump(mode="json")
                 yield f"data: {json.dumps(last_partial)}\n\n"
             _log(url, t0, status="ok")

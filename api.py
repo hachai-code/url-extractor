@@ -10,6 +10,7 @@ import uuid
 import structlog
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, HttpUrl
 
@@ -35,6 +36,12 @@ log = structlog.get_logger("api")
 init_db()
 
 app = FastAPI(title="url-extractor", version="0.1.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_methods=["POST", "GET"],
+    allow_headers=["content-type"],
+)
 
 
 class ExtractRequest(BaseModel):

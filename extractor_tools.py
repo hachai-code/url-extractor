@@ -26,9 +26,32 @@ from dotenv import load_dotenv
 from langfuse import get_client
 from pydantic import ValidationError
 
+from db import cost_usd
 from extractor import SYSTEM_PROMPT, USER_TEMPLATE
 from schemas import PageAnalysis
 from tools import fetch_linked_article, lookup_wikipedia
+
+
+class ToolCallBudgetExceeded(RuntimeError):
+    """Raised when the loop exceeds max_tool_calls."""
+
+
+class CostBudgetExceeded(RuntimeError):
+    """Raised when the running USD spend exceeds max_cost_usd."""
+
+
+def _check_tool_budget(tool_calls: int, limit: int) -> None:
+    if tool_calls >= limit:
+        raise ToolCallBudgetExceeded(
+            f"tool call limit reached: {tool_calls} >= {limit}"
+        )
+
+
+def _check_cost_budget(running_cost: float, limit: float) -> None:
+    if running_cost > limit:
+        raise CostBudgetExceeded(
+            f"cost ${running_cost:.4f} exceeds budget ${limit:.2f}"
+        )
 
 load_dotenv()
 _client = anthropic.Anthropic()
@@ -153,6 +176,8 @@ def extract_page_with_tools(
     model: str = "claude-haiku-4-5",
     max_tokens: int = 8192,
     max_iterations: int = 6,
+    max_tool_calls: int = 5,
+    max_cost_usd: float = 0.50,
 ) -> PageAnalysis:
     """Extract a PageAnalysis via a multi-step tool-use loop.
 
@@ -194,6 +219,16 @@ def extract_page_with_tools(
                     last_stats["llm_calls"] += 1
                     last_stats["input_tokens"] += response.usage.input_tokens
                     last_stats["output_tokens"] += response.usage.output_tokens
+
+                    # Stop the loop if spend has crossed the budget.
+                    _check_cost_budget(
+                        cost_usd(
+                            model,
+                            last_stats["input_tokens"],
+                            last_stats["output_tokens"],
+                        ),
+                        max_cost_usd,
+                    )
 
                     gen.update(
                         input=messages,
@@ -238,6 +273,7 @@ def extract_page_with_tools(
                                 "is_error": True,
                             })
                     else:
+                        _check_tool_budget(last_stats["tool_calls"], max_tool_calls)
                         last_stats["tool_calls"] += 1
                         last_stats["tool_call_log"].append(
                             {"name": block.name, "input": block.input}

@@ -10,7 +10,7 @@ import uuid
 
 import structlog
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, HttpUrl
@@ -74,6 +74,55 @@ class ExtractRequest(BaseModel):
 # so old entries naturally fall out without us having to invalidate them.
 PROMPT_HASH = hashlib.sha256(SYSTEM_PROMPT.encode()).hexdigest()[:16]
 
+# Abuse-protection limits. Tune per environment if needed.
+MAX_TEXT_BYTES = 200 * 1024  # 200 KB of cleaned text per page
+RATE_LIMIT_REQUESTS = 5      # per window, per IP
+RATE_LIMIT_WINDOW_SECONDS = 60
+
+# In-memory sliding-window rate limit state: { ip: [recent_timestamps...] }.
+# Single-process only; for multi-worker deployments swap to Redis.
+_rate_limit_state: dict[str, list[float]] = {}
+
+
+def _check_rate_limit(ip: str) -> tuple[bool, int]:
+    """Return (allowed, retry_after_seconds). Mutates the per-IP window."""
+    now = time.monotonic()
+    cutoff = now - RATE_LIMIT_WINDOW_SECONDS
+    bucket = _rate_limit_state.setdefault(ip, [])
+    bucket[:] = [t for t in bucket if t > cutoff]
+    if len(bucket) >= RATE_LIMIT_REQUESTS:
+        retry_after = int(RATE_LIMIT_WINDOW_SECONDS - (now - bucket[0])) + 1
+        return False, retry_after
+    bucket.append(now)
+    return True, 0
+
+
+def rate_limit(http: Request) -> str:
+    """FastAPI dependency: blocks IPs that exceed RATE_LIMIT_REQUESTS per window."""
+    ip = http.client.host if http.client else "unknown"
+    ok, retry_after = _check_rate_limit(ip)
+    if not ok:
+        raise HTTPException(
+            status_code=429,
+            detail={"error": "rate_limited", "retry_after_seconds": retry_after},
+            headers={"Retry-After": str(retry_after)},
+        )
+    return ip
+
+
+def _check_text_size(text: str) -> None:
+    """Raise 413 if the extracted page text exceeds MAX_TEXT_BYTES."""
+    size = len(text.encode("utf-8"))
+    if size > MAX_TEXT_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail={
+                "error": "page_too_large",
+                "size_bytes": size,
+                "max_bytes": MAX_TEXT_BYTES,
+            },
+        )
+
 
 class ExtractError(BaseModel):
     stage: str = Field(..., description="Which pipeline stage failed: 'fetch' or 'extract'.")
@@ -106,7 +155,7 @@ def _log(url: str, t0: float, *, status: str, error_detail: str | None = None) -
     )
 
 
-@app.post("/extract", response_model=PageAnalysis)
+@app.post("/extract", response_model=PageAnalysis, dependencies=[Depends(rate_limit)])
 def extract(request: ExtractRequest) -> PageAnalysis:
     t0 = time.monotonic()
     url = str(request.url)
@@ -131,8 +180,10 @@ def extract(request: ExtractRequest) -> PageAnalysis:
             detail=ExtractError(stage="fetch", kind=fetched.error, detail=fetched.error_detail or "").model_dump(),
         )
 
+    assert fetched.text is not None  # fetched.ok guarantees this
+    _check_text_size(fetched.text)
+
     try:
-        assert fetched.text is not None  # fetched.ok guarantees this
         result = extract_page(fetched.text, str(fetched.final_url or url))
         _log(url, t0, status="ok")
         put_cached(url, DEFAULT_MODEL, PROMPT_HASH, result.model_dump(mode="json"))
@@ -153,7 +204,7 @@ def extract(request: ExtractRequest) -> PageAnalysis:
         ) from exc
 
 
-@app.post("/extract/stream")
+@app.post("/extract/stream", dependencies=[Depends(rate_limit)])
 async def extract_stream(request: ExtractRequest) -> StreamingResponse:
     """Same pipeline as /extract, but streams partial PageAnalysis snapshots as
     Server-Sent Events. Each `data:` line is the JSON of the model so far.
@@ -192,6 +243,9 @@ async def extract_stream(request: ExtractRequest) -> StreamingResponse:
             status_code=status_code,
             detail=ExtractError(stage="fetch", kind=fetched.error, detail=fetched.error_detail or "").model_dump(),
         )
+
+    assert fetched.text is not None
+    _check_text_size(fetched.text)
 
     async def event_stream():
         last_partial: dict | None = None

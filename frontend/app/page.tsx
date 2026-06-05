@@ -13,7 +13,7 @@ const TABS = ["Summary", "Entities", "Claims", "Action Items"] as const;
 type Tab = (typeof TABS)[number];
 type Phase = "idle" | "streaming" | "done" | "error";
 
-const API_BASE = "http://localhost:8000";
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
 
 export default function HomePage() {
   const [url, setUrl] = useState("");

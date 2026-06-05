@@ -221,6 +221,8 @@ Produce a PageAnalysis from the source above, following the instructions
 and output requirements.
 """
 
+DEFAULT_MODEL = "claude-haiku-4-5"
+
 _client = instructor.from_anthropic(anthropic.Anthropic())
 
 # Stats from the most recent extract_page() call. Read after each call.
@@ -260,7 +262,7 @@ def extract_page(
     text: str,
     url: str,
     *,
-    model: str = "claude-haiku-4-5",
+    model: str = DEFAULT_MODEL,
     max_tokens: int = 8192,
     max_retries: int = 3,
 ) -> PageAnalysis:
@@ -284,7 +286,7 @@ def extract_page_stream(
     text: str,
     url: str,
     *,
-    model: str = "claude-haiku-4-5",
+    model: str = DEFAULT_MODEL,
     max_tokens: int = 8192,
 ):
     """Yield progressively-complete PageAnalysis snapshots as Claude generates them.

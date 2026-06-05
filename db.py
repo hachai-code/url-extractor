@@ -7,6 +7,7 @@ after each request, and `stats()` to read aggregates.
 from __future__ import annotations
 
 import json
+import secrets
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -56,6 +57,39 @@ def init_db() -> None:
             """
         )
         con.execute("CREATE INDEX IF NOT EXISTS extractions_ts ON extractions(ts)")
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS analyses_saved (
+                id         TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                url        TEXT NOT NULL,
+                analysis   TEXT NOT NULL
+            )
+            """
+        )
+
+
+def save_analysis(url: str, analysis: dict) -> str:
+    """Persist a completed analysis and return its short share id."""
+    aid = secrets.token_urlsafe(8)
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute(
+            "INSERT INTO analyses_saved (id, created_at, url, analysis) VALUES (?, ?, ?, ?)",
+            (aid, datetime.now(timezone.utc).isoformat(), url, json.dumps(analysis)),
+        )
+    return aid
+
+
+def get_analysis(aid: str) -> dict | None:
+    """Fetch a saved analysis by id, or None if it doesn't exist."""
+    with sqlite3.connect(DB_PATH) as con:
+        row = con.execute(
+            "SELECT url, analysis, created_at FROM analyses_saved WHERE id = ?",
+            (aid,),
+        ).fetchone()
+    if row is None:
+        return None
+    return {"url": row[0], "analysis": json.loads(row[1]), "created_at": row[2]}
 
 
 def log_call(

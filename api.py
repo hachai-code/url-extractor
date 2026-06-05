@@ -14,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, HttpUrl
 
-from db import init_db, log_call, stats as db_stats
+from db import get_analysis, init_db, log_call, save_analysis, stats as db_stats
 from extractor import extract_page, extract_page_stream, last_stats, reset_stats
 from fetch import fetch_page
 from schemas import PageAnalysis
@@ -146,10 +146,12 @@ def extract_stream(request: ExtractRequest) -> StreamingResponse:
         )
 
     def event_stream():
+        last_partial: dict | None = None
         try:
             assert fetched.text is not None
             for partial in extract_page_stream(fetched.text, str(fetched.final_url or url)):
-                yield f"data: {partial.model_dump_json()}\n\n"
+                last_partial = partial.model_dump(mode="json")
+                yield f"data: {json.dumps(last_partial)}\n\n"
             _log(url, t0, status="ok")
             rlog.info(
                 "stream_complete",
@@ -158,13 +160,23 @@ def extract_stream(request: ExtractRequest) -> StreamingResponse:
                 output_tokens=last_stats["output_tokens"],
                 latency_ms=int((time.monotonic() - t0) * 1000),
             )
-            yield "event: done\ndata: {}\n\n"
+            saved_id = save_analysis(url, last_partial) if last_partial else None
+            yield f"event: done\ndata: {json.dumps({'id': saved_id})}\n\n"
         except Exception as exc:
             _log(url, t0, status="extract_failed", error_detail=f"{type(exc).__name__}: {str(exc)[:300]}")
             rlog.exception("stream_failed", kind=type(exc).__name__)
             yield f"event: error\ndata: {json.dumps({'kind': type(exc).__name__, 'detail': str(exc)[:200]})}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@app.get("/analyses/{aid}")
+def get_saved_analysis(aid: str) -> dict:
+    """Fetch a previously-saved analysis by its share id."""
+    record = get_analysis(aid)
+    if record is None:
+        raise HTTPException(status_code=404, detail={"error": "analysis not found"})
+    return record
 
 
 @app.get("/metrics")

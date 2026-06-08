@@ -17,5 +17,3 @@ Thumbs.db
 
 # Generated artifacts
 logs.db
-eval_results.json
-eval_results_*.json

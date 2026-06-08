@@ -7,6 +7,7 @@ before sending it to the LLM.
 
 from __future__ import annotations
 
+import threading
 from typing import Literal
 
 import httpx
@@ -19,6 +20,13 @@ USER_AGENT = (
 )
 DEFAULT_TIMEOUT = 15.0
 MAX_BYTES = 5_000_000  # 5 MB — anything bigger is almost certainly not an article
+
+# Cap concurrent fetch+parse work. trafilatura builds an lxml DOM that can use
+# ~10x the page size in RAM, so a handful of large pages in flight at once can
+# OOM a small instance (e.g. Render's 512 MB tier). This bounds peak memory no
+# matter how many requests arrive. Raise it on bigger instances.
+MAX_CONCURRENT_FETCHES = 3
+_fetch_slots = threading.BoundedSemaphore(MAX_CONCURRENT_FETCHES)
 
 
 ErrorKind = Literal[
@@ -51,7 +59,16 @@ class FetchResult(BaseModel):
 
 
 def fetch_page(url: str, *, timeout: float = DEFAULT_TIMEOUT) -> FetchResult:
-    """Fetch `url` and return main content + metadata, or a populated error."""
+    """Fetch `url` and return main content + metadata, or a populated error.
+
+    Holds one of MAX_CONCURRENT_FETCHES slots for the whole fetch+parse, so a
+    burst of large pages can't exhaust memory on a small instance.
+    """
+    with _fetch_slots:
+        return _fetch(url, timeout=timeout)
+
+
+def _fetch(url: str, *, timeout: float) -> FetchResult:
     try:
         with httpx.Client(
             follow_redirects=True,

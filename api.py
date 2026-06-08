@@ -11,6 +11,7 @@ import uuid
 import structlog
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, HttpUrl
@@ -235,7 +236,9 @@ async def extract_stream(request: ExtractRequest) -> StreamingResponse:
 
             return StreamingResponse(cached_stream(), media_type="text/event-stream")
 
-    fetched = fetch_page(url)
+    # Run the blocking fetch+parse in a worker thread so its concurrency-gate
+    # wait never stalls the event loop (and other streams keep flowing).
+    fetched = await run_in_threadpool(fetch_page, url)
     if not fetched.ok:
         _log(url, t0, status="fetch_failed", error_detail=f"{fetched.error}: {fetched.error_detail}")
         rlog.warning("fetch_failed", error=fetched.error, detail=fetched.error_detail)
